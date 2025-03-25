@@ -1,0 +1,39 @@
+# %%
+import numpy as np
+
+# %% [markdown]
+# iid data
+
+# %%
+np.random.seed(42)
+X_all = np.random.rand(10000, 1) * 10  # Generate 1000 one-dimensional input data points
+y_all = np.sin(X_all[:, 0]) + np.random.randn(10000) * 0.1  # Noisy target values
+
+# %% [markdown]
+# Shift data
+
+# %%
+np.random.seed(42)
+X_all = np.random.rand(10000, 1) * 10  # Generate 1000 one-dimensional input data points
+y_first = np.sin(X_all[:5000, 0]) + np.random.randn(5000) * 0.1
+y_last = np.sin(X_all[5000:, 0])+ np.random.randn(5000) * 0.2
+y_all = np.concatenate([y_first, y_last])
+
+
+# %% [markdown]
+# real world data
+
+# %%
+!pip install yfinance
+!pip install scikit-optimize
+import numpy as np
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+from scipy.linalg import solve
+import yfinance as yf
+import numba
+ticker = 'AAPL'
+data = yf.download(ticker, start='2016-01-01', end='2021-01-01')
+X_all = data[['Open','High','Low']].values
+y_all = data['Close'].values
+
