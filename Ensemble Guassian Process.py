@@ -11,10 +11,16 @@ sigma_f^2 is handled separately as the weight-space prior in gp_predict().
 
 All samplers below were validated by comparing the RFF Gram matrix against the
 exact kernel (max abs error ~0.01 at D=2e4, 1-D inputs, l=1).
+
+On top of the (ensemble) GP we run ONLINE CONFORMAL PREDICTION with a decaying
+step size (Angelopoulos, Barber & Bates, 2024, arXiv:2402.01139), using the
+Gaussian negative log-likelihood as the conformal score. This wraps the GP's
+point predictions in calibrated prediction sets with a long-run coverage
+guarantee that does NOT rely on the GP variance being correctly specified.
 """
 
 import numpy as np
-from scipy.stats import cauchy, gamma
+from scipy.stats import cauchy, gamma, chi2
 from sklearn.metrics import mean_squared_error
 import matplotlib.pyplot as plt
 
@@ -116,21 +122,74 @@ def gaussian_loglik(y, mu, var):
 # 6. Causal multiplicative-weights ensemble (Bayesian model averaging).
 #    w_i  <-  w_i * p_i(y_t),  done in log-space for stability.
 #    The prediction for point t uses weights from points < t (no leakage).
+#    Also returns the mixture predictive mean & variance (moment-matched
+#    Gaussian), which the conformal layer uses for the NLL score.
 # ----------------------------------------------------------------------
-def ensemble(preds, logliks, init_weights=None):
+def ensemble(preds, varis, logliks, init_weights=None):
     n_models, T = preds.shape
     w = (np.full(n_models, 1.0 / n_models) if init_weights is None
          else np.asarray(init_weights, float))
-    ens = np.zeros(T)
+    ens_mu = np.zeros(T)
+    ens_var = np.zeros(T)
     weight_hist = np.zeros((T, n_models))
     for t in range(T):
         weight_hist[t] = w
-        ens[t] = w @ preds[:, t]                 # causal prediction
+        mu_t = w @ preds[:, t]                              # mixture mean
+        # variance of a mixture of Gaussians:
+        #   Var = sum_i w_i (var_i + mu_i^2) - (sum_i w_i mu_i)^2
+        second = w @ (varis[:, t] + preds[:, t] ** 2)
+        ens_mu[t] = mu_t
+        ens_var[t] = second - mu_t ** 2
         logw = np.log(w + 1e-300) + logliks[:, t]
         logw -= logw.max()
         w = np.exp(logw)
         w /= w.sum()
-    return ens, weight_hist
+    return ens_mu, ens_var, weight_hist
+
+
+# ----------------------------------------------------------------------
+# 7. Online conformal prediction with decaying step size
+#    (Angelopoulos, Barber & Bates, 2024).
+#
+#    Score (Gaussian NLL):
+#        s_t(y) = 0.5*log(2*pi*sigma_t^2) + (y - mu_t)^2 / (2*sigma_t^2)
+#    Prediction set  C_t = {y : s_t(y) <= q_t}  is the closed interval
+#        mu_t +/- sqrt( 2*sigma_t^2 * (q_t - 0.5*log(2*pi*sigma_t^2)) ),
+#    or EMPTY when the radicand is < 0. (Unlike a residual score, the NLL
+#    diverges as |y|->inf, so the set is never infinite.)
+#    Threshold update (eq. 4):
+#        q_{t+1} = q_t + eta_t * ( 1{Y_t not in C_t} - alpha )
+#    Step size:  'decaying' -> eta_t = c * t^{-1/2 - eps}   (the paper's method)
+#                float       -> fixed eta_t = const          (Gibbs & Candes 2021)
+# ----------------------------------------------------------------------
+def online_conformal(y, mu, var, alpha=0.1, step="decaying", c=1.0, eps=0.1,
+                     q1=None):
+    T = len(y)
+    var = np.maximum(np.asarray(var, float), 1e-12)
+    nll_min = 0.5 * np.log(2.0 * np.pi * var)              # min score, at y = mu
+    score = nll_min + (y - mu) ** 2 / (2.0 * var)          # observed score s_t(Y_t)
+
+    # warm-start the threshold near the calibrated quantile to shorten burn-in
+    if q1 is None:
+        q1 = float(np.median(nll_min) + chi2.ppf(1.0 - alpha, df=1) / 2.0)
+    q = q1
+
+    lo = np.full(T, np.nan)
+    hi = np.full(T, np.nan)
+    covered = np.zeros(T, dtype=bool)
+    q_path = np.empty(T)
+
+    for t in range(T):
+        q_path[t] = q
+        radicand = 2.0 * var[t] * (q - nll_min[t])
+        if radicand >= 0.0:                                # non-empty interval
+            h = np.sqrt(radicand)
+            lo[t], hi[t] = mu[t] - h, mu[t] + h
+        covered[t] = score[t] <= q                         # Y_t in C_t ?
+        eta = c * (t + 1) ** (-0.5 - eps) if step == "decaying" else float(step)
+        q = q + eta * ((0.0 if covered[t] else 1.0) - alpha)
+
+    return dict(lo=lo, hi=hi, covered=covered, q_path=q_path, score=score)
 
 
 # ======================================================================
@@ -165,29 +224,64 @@ if __name__ == "__main__":
         results[name] = dict(pred=preds, var=varis)
     truth = truths  # same ordering for every kernel
 
-    # ---- ensemble ----
+    # ---- ensemble (causal weights + mixture predictive mean/variance) ----
     names = list(kernels.keys())
     pred_mat = np.vstack([results[n]["pred"] for n in names])       # (4, T)
+    var_mat = np.vstack([results[n]["var"] for n in names])         # (4, T)
     ll_mat = np.vstack([gaussian_loglik(truth, results[n]["pred"],
                                         results[n]["var"]) for n in names])
-    ens_pred, weight_hist = ensemble(pred_mat, ll_mat)
+    ens_mu, ens_var, weight_hist = ensemble(pred_mat, var_mat, ll_mat)
 
-    # ---- metrics ----
     print("MSE per kernel:")
     for n in names:
         print(f"  {n:8s}: {mean_squared_error(truth, results[n]['pred']):.5f}")
-    print(f"  {'Ensemble':8s}: {mean_squared_error(truth, ens_pred):.5f}")
+    print(f"  {'Ensemble':8s}: {mean_squared_error(truth, ens_mu):.5f}")
 
-    # ---- plot ----
+    # ---- online conformal prediction on the ensemble (Gaussian-NLL score) ----
+    alpha = 0.1
+    cp_decay = online_conformal(truth, ens_mu, ens_var, alpha=alpha,
+                                step="decaying", c=1.0, eps=0.1)
+    cp_fixed = online_conformal(truth, ens_mu, ens_var, alpha=alpha,
+                                step=0.05)
+
+    def report(tag, cp):
+        cov = cp["covered"].mean()
+        width = np.nanmean(cp["hi"] - cp["lo"])
+        empty = np.mean(np.isnan(cp["lo"]))
+        print(f"  {tag:18s} long-run coverage={cov:.3f} "
+              f"(target {1-alpha:.2f}) | mean width={width:.3f} | "
+              f"empty-set rate={empty:.3f}")
+
+    print(f"\nOnline conformal prediction (alpha={alpha}):")
+    report("decaying eta_t", cp_decay)
+    report("fixed eta=0.05", cp_fixed)
+
+    # ---- plots: prediction band, threshold path, rolling coverage ----
+    def rolling(c, w=1000):
+        c = c.astype(float)
+        return np.convolve(c, np.ones(w) / w, mode="valid")
+
+    fig, ax = plt.subplots(1, 3, figsize=(16, 4.2))
+
     lo, hi = 100, 300
-    plt.figure(figsize=(12, 6))
-    plt.plot(range(lo, hi), truth[lo:hi], 'ro', label='True')
-    plt.plot(range(lo, hi), ens_pred[lo:hi], 'bx-', label='Ensemble prediction')
-    plt.title("Online GP regression with RFF (kernel ensemble)")
-    plt.xlabel("Sample index")
-    plt.ylabel("Value")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig("online_gp_rff.png", dpi=120)
-    print("Saved plot -> online_gp_rff.png")
+    ax[0].fill_between(range(lo, hi), cp_decay["lo"][lo:hi],
+                       cp_decay["hi"][lo:hi], alpha=0.25, color="C0",
+                       label=f"{int((1-alpha)*100)}% conformal set")
+    ax[0].plot(range(lo, hi), ens_mu[lo:hi], "C0-", lw=1, label="Ensemble mean")
+    ax[0].plot(range(lo, hi), truth[lo:hi], "r.", ms=4, label="True")
+    ax[0].set_title("Ensemble GP + conformal band")
+    ax[0].set_xlabel("sample index"); ax[0].legend(fontsize=8)
 
+    ax[1].plot(cp_fixed["q_path"], color="C1", lw=0.8, label="fixed eta")
+    ax[1].plot(cp_decay["q_path"], color="C0", lw=0.8, label="decaying eta")
+    ax[1].set_title("Threshold q_t"); ax[1].set_xlabel("t"); ax[1].legend(fontsize=8)
+
+    ax[2].axhline(1 - alpha, color="k", ls=":", label="1 - alpha")
+    ax[2].plot(rolling(cp_fixed["covered"]), color="C1", lw=0.8, label="fixed eta")
+    ax[2].plot(rolling(cp_decay["covered"]), color="C0", lw=0.8, label="decaying eta")
+    ax[2].set_title("Rolling coverage (window 1000)")
+    ax[2].set_xlabel("t"); ax[2].set_ylim(0.7, 1.0); ax[2].legend(fontsize=8)
+
+    plt.tight_layout()
+    plt.savefig("online_gp_rff_conformal.png", dpi=120)
+    print("Saved plot -> online_gp_rff_conformal.png")
